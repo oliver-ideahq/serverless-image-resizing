@@ -89,10 +89,8 @@ var Resize = function (imgData, filterSet) {
         if (f.size[0] > metadata.width && f.size[1] < metadata.height) {
           // width is smaller than the min width
           resizeWidth = metadata.width;
-          resizeHeight = metadata.width;
         } else if (f.size[0] < metadata.width && f.size[1] > metadata.height) {
           // height is smaller than the min height
-          resizeWidth = metadata.height;
           resizeHeight = metadata.height;          
         } else if (f.size[0] > metadata.width && f.size[1] > metadata.height) {
           // height and width is smaller than the min height and width
