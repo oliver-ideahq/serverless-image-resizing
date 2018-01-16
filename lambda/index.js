@@ -1,24 +1,33 @@
 'use strict';
 
-const AWS = require('aws-sdk');
+const AWSXRay = require('aws-xray-sdk-core');
+const AWS = AWSXRay.captureAWS(require('aws-sdk'));
 const S3 = new AWS.S3();
 const Sharp = require('sharp');
+const logger = require('winston');
 
+AWSXRay.setLogger(logger);
 
 // These need to be defined in AWS with the Lambda
 const SRC_BUCKET = process.env.SRC_BUCKET;
+const ORIG_SRC_BUCKET = process.env.ORIG_SRC_BUCKET;
 const DST_BUCKET = process.env.DST_BUCKET;
 const URL = process.env.URL;
+const STAGE = process.env.stage;
 
+logger.log('info', 'process.env', process.env);
+logger.log('info', 'STAGE', STAGE);
+logger.log('info', 'Redirect URL', URL);
+logger.log('info', 'SRC_BUCKET', SRC_BUCKET);
+logger.log('info', 'ORIG_SRC_BUCKET', ORIG_SRC_BUCKET);
+logger.log('info', 'DST_BUCKET', DST_BUCKET);
 
 // JSON file generated from the "liip_imagine -> filter_sets" section of
 // neighbourly/app/config.yml file.
 //
-// A one-off way of producing this is to cut and paste the liip_image section
-// from the config into a new file, and run the following command:
-// $ ruby -ryaml -rjson -e 'puts JSON.pretty_generate(YAML.load(ARGF)["liip_imagine"]["filter_sets"])' < liip_imagine_filter_sets.yaml > liip_imagine_filter_sets.json
+// This is generated via the neighbourly:create-serverless-image-resizing-config Neighbourly symfony command
+// ALSO see the ansible playbook build-serverless-image-resizing which generates and copies the file in place (among building this whole module)
 var filterSet = require('./liip_imagine_filter_sets.json');
-
 
 // Implement a subset of the Liip Imagine filters
 // (only the ones that appear in the config)
@@ -29,7 +38,6 @@ var filterSet = require('./liip_imagine_filter_sets.json');
 // If you add different kinds of filters or parameters to that config
 // you may need to modify this function to support them
 var Resize = function (imgData, filterSet) {
-
   const filters = filterSet.filters;
   var imageFormat;
   var jpegOptions = {};
@@ -124,6 +132,7 @@ var Resize = function (imgData, filterSet) {
     // scale the image to the width specified, maintaining aspect
     // ratio for the height.
     if (filters.hasOwnProperty('relative_resize')) {
+      img = img.resize(f.size[0], f.size[1]);
 
       var r = filters.relative_resize;
 
@@ -141,7 +150,7 @@ var Resize = function (imgData, filterSet) {
 
     return img.metadata()
       .then(metadata => {
-        if(metadata.format == 'gif') {
+        if(metadata.format === 'gif') {
           // GIF is not a Sharp supported output format, so
           // we have to kinda cheat. Set the output format and the mimeType
           // to PNG, but keep the actual filename with the GIF extension
@@ -152,16 +161,18 @@ var Resize = function (imgData, filterSet) {
         }
 
         // JPEGs have additional settings for quality
-        if (imageFormat === "jpeg") {
+        if (imageFormat === "jpeg" && jpegOptions) {
           outputOptions = jpegOptions;
+          logger.log('info', 'output options', outputOptions);
         }
 
-        return img.toFormat(imageFormat, outputOptions)
-          .toBuffer()
-          .then(buffer => {
-            return { data: buffer, mimeType: "image/" + imageFormat }
-          })
-      })    
+        return img.toFormat(imageFormat, outputOptions).toBuffer();
+      })
+      .then(data => {
+        logger.log('info', 'mime type', imageFormat);
+        return { data: data, mimeType: "image/" + imageFormat }
+      })
+      .catch(err => { logger.log('error', 'resizing error', err) });
   })
 }
 
@@ -214,10 +225,10 @@ var getCorrectMimeType = function (filename, mimeType) {
   return newMimeType;
 }
 
-var ResizeAndCopy = function (event, context, callback) {
+const ResizeAndCopy = function (path, context, callback) {
+  logger.log('info', 'filterSet', filterSet);
 
-  const path = event.queryStringParameters.key;
-  var pieces = path.toString().split('/');
+  const pieces = path.toString().split('/');
 
   // Valid paths will look something like
   // images/cache/_filter_type_/_collection_/_filename_._filetype_?_optional_cachebuster_
@@ -238,7 +249,7 @@ var ResizeAndCopy = function (event, context, callback) {
   // Some older paths in the wild will have an extra "images" component e.g.
   // images/cache/_filter_type_/images/_collection_/_filename_._filetype_?_optional_cachebuster_
   // Need to cater for those and strip the second "image" from source path
-  var startPiece = 3;
+  let startPiece = 3;
   if (pieces[3] === 'images') {
     startPiece = 4;
   }
@@ -260,24 +271,87 @@ var ResizeAndCopy = function (event, context, callback) {
   // - resize it according to the specified filter parameters
   // - store it in the destination S3 bucket
   // - redirect the client to look for the newly created image.
-  S3.getObject({ Bucket: SRC_BUCKET, Key: srcKey }).promise()
-    .then(data => Resize(data.Body, selectedFilterSet))
-    .then(img => S3.putObject({
-      Body: img.data,
-      Bucket: DST_BUCKET,
-      ContentType: img.mimeType,
-      CacheControl: "public, max-age=2592000",
-      Key: dstKey,
-    }).promise()
-    )
-    .then(() => callback(null, {
-      statusCode: '301',
-      headers: { 'location': `${URL}/${dstKey}` },
-      body: '',
+  const storeResizedImage = function(data, filterSet) {
+    const imgPromise = Resize(data, filterSet);
+
+    logger.log('info', 'Storing resized image', DST_BUCKET, dstKey);
+    logger.log('info', 'Saving then redirecting to', `${URL}${dstKey}`);
+
+    imgPromise.then(img => {
+      S3.putObject({
+        Body: img.data,
+        Bucket: DST_BUCKET,
+        ContentType: img.mimeType,
+        CacheControl: "public, max-age=2592000",
+        Key: dstKey
+      }).promise()
+      .then(function() {
+        if (STAGE !== 'prod') {
+          logger.log('info', 'Setting object ACL - dev only - not required when used with CloudFormation!');
+
+          return S3.putObjectAcl({
+            Bucket: DST_BUCKET,
+            Key: dstKey,
+            ACL: 'public-read'
+          }).promise();
+        }
+
+        logger.log('info', 'Returning empty promise. ;-(');
+
+        return Promise.resolve();
+      })
+      .then(() => callback(null, {
+        statusCode: 301,
+        headers: { 'Location': `${URL}${dstKey}` },
+        body: null,
+      })
+      );
     })
-    )
-    .catch(err => callback(err))
-}
+    .catch(err => callback(err));
+  };
+
+  S3.getObject({ Bucket: SRC_BUCKET, Key: srcKey }, function(err, data) {
+      if (err) {
+        logger.log('warn', "%s --- %j", err, err.stack);
+
+        if (STAGE !== 'prod') {
+          logger.log('info', 'Trying to get from orig src bucket %s with key %s', ORIG_SRC_BUCKET, srcKey);
+          // we assume here that the object doesn't exist and we try to get it from the original bucket (production)
+          S3.getObject({ Bucket: ORIG_SRC_BUCKET, Key: srcKey }, function(err, getData) {
+            if (err) {
+              logger.log('error', 'Failed to get from orig src bucket', err);
+
+              callback(err);
+              return err;
+            }
+
+            logger.log('info', 'successfully retrieved data from orig src bucket');
+
+            S3.putObject({
+                Body: getData.Body,
+                Bucket: SRC_BUCKET,
+                Key: srcKey
+            }, function(err, data) {
+              if (err) {
+                logger.log('error', 'Failed to save to src bucket', err);
+              } else {
+                  logger.log('info', 'Stored image in src bucket');
+
+                  storeResizedImage(getData.Body, selectedFilterSet);
+              }
+            });
+          });
+        } else {
+          logger.log('warn', 'Object not found.');
+          callback('Object not found.');
+        }
+      } else {
+        logger.log('info', 'Found image in src bucket');
+
+        storeResizedImage(data.Body, selectedFilterSet);
+      }
+  });
+};
 
 // - read the original file from the src S3 bucket with "images/" prefix stripped,
 // - store it in the destination S3 bucket with the
@@ -291,7 +365,8 @@ var Copy = function (event, context, callback) {
 
   if (pieces.length < 3 || pieces[0] !== 'images') {
     // Send generic 404 to client for clearly invalid paths
-    console.log("Invalid path format for file specified : " + path)
+    logger.log('warn', "Invalid path format for file specified : " + path);
+
     callback(null, {
       statusCode: '404',
       body: "Not Found."
@@ -307,7 +382,8 @@ var Copy = function (event, context, callback) {
   // served directly by the bucket public web interface.
   const dstKey = path.split('?')[0];
 
-  console.log('Copying. arn:aws:s3:::%s/%s ==> arn:aws:s3:::%s/%s', SRC_BUCKET, srcKey, DST_BUCKET, dstKey);
+  logger.log('info', 'Copying. arn:aws:s3:::%s/%s ==> arn:aws:s3:::%s/%s', SRC_BUCKET, srcKey, DST_BUCKET, dstKey);
+  logger.log('info', 'Saving then redirecting to', `${URL}/${dstKey}`);
 
   S3.getObject({ Bucket: SRC_BUCKET, Key: srcKey }).promise()
     .then(data => S3.putObject({
@@ -318,24 +394,30 @@ var Copy = function (event, context, callback) {
     }).promise()
     )
     .then(() => callback(null, {
-      statusCode: '301',
-      headers: { 'location': `${URL}/${dstKey}` },
-      body: '',
+      statusCode: 301,
+      headers: { 'Location': `${URL}/${dstKey}` },
+      body: null,
     })
     )
-    .catch(err => callback(err))
-}
+    .catch(err => callback(err));
+};
 
 exports.handler = (event, context, callback) => {
+  let path = event.queryStringParameters.key;
 
-  // console.log("event.queryStringParameters.key : " + event.queryStringParameters.key)
-  // console.log("event.queryStringParameters.key.substr(0, 13) : " + event.queryStringParameters.key.substr(0, 13) )
+  if (path[0] === '/') {
+    path = path.substr(1);
+  }
 
-  // If it's for an image that needs resizing...
-  if (event.queryStringParameters.key.substr(0, 13) === 'images/cache/') {
-    return ResizeAndCopy(event, context, callback)
+  logger.log('info', 'path', path);
+
+  if (path.substr(0, 13) === 'images/cache/') {
+    logger.log('info', 'Image resize and copy');
+    return ResizeAndCopy(path, context, callback)
   } else {
-    // It's just something that used to be served up via direct_file_link
+    // TODO this doesn't seem to be in play yet?
+    // TODO not supported on dev yet! See double S3 copy in ResizeAndCopy!
+    logger.log('info', 'File copy / direct_file_link');
     return Copy(event, context, callback)
   }
 };
